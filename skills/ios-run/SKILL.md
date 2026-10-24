@@ -1,6 +1,6 @@
 ---
 name: ios-run
-description: 在不开 Xcode 的情况下完成 iOS 真机开发闭环——编译、安装、启动到 iPhone，并在失败时自动诊断原因（开发证书、iOS SDK、xcode-select、设备连接、CocoaPods 等）。当需要把 iOS 项目构建并运行到真机、验证代码改动、排查真机构建/安装/启动失败、查看已连接设备时使用。
+description: 在不开 Xcode 的情况下完成 iOS 真机开发闭环——编译、安装、启动到 iPhone，并在失败时自动诊断原因（开发证书、iOS SDK、xcode-select、设备连接、CocoaPods 等）。当需要把 iOS 项目构建并运行到真机、验证代码改动、清理构建产物后重新编译、排查真机构建/安装/启动失败、查看已连接设备时使用。触发说法包括：跑一下 / 运行一下这个 App、启动 App 看效果、装到手机上、真机上跑、真机调试、xcodebuild 构建、clean 一下 / 清理构建产物 / 清 DerivedData / 重新编译、签名或证书报错、看不到设备。
 ---
 
 # iOS 真机运行
