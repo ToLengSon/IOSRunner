@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # iOS 真机：编译 -> 安装 -> 启动，输出精简结果（完整日志写文件，不灌终端）
 #
-#   ios-run.sh                         # 当前目录找容器，自动选设备
+#   ios-run.sh                         # 自动选设备（上次使用的 > 唯一在线）
+#   ios-run.sh --list                  # 只列设备清单和状态，不构建
 #   ios-run.sh -p ~/proj/App.xcworkspace -d "iPhone 13"
 #   ios-run.sh --clean --json          # 清理后构建，输出 JSON 供程序解析
 #   ios-run.sh -s MyApp -v             # 指定 scheme 并打印完整日志
+#   设备优先级：-d > IOSRunner.app 选择 > 上次使用(在线) > 唯一在线设备
 set -uo pipefail
 
 PROJECT=""
@@ -12,6 +14,7 @@ DEVICE=""
 SCHEME=""
 CONFIG="Debug"
 DO_CLEAN=0
+DO_LIST=0
 JSON=0
 VERBOSE=0
 
@@ -22,6 +25,7 @@ while [[ $# -gt 0 ]]; do
     -s|--scheme)  SCHEME="${2:-}";  shift 2 ;;
     --config)     CONFIG="${2:-}";  shift 2 ;;
     --clean)      DO_CLEAN=1; shift ;;
+    -l|--list)    DO_LIST=1; shift ;;
     --json)       JSON=1; shift ;;
     -v|--verbose) VERBOSE=1; shift ;;
     -h|--help)    sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -71,8 +75,31 @@ CONTAINER_NAME="${CONTAINER_NAME%.*}"
 DEVJSON="$RUN_TMP/devices.json"
 xcrun devicectl list devices --json-output "$DEVJSON" --quiet >/dev/null 2>&1 || true
 
-DEV_LIST="$(python3 - "$DEVJSON" <<'PY'
-import json, sys
+# 「是否在线」以 xctrace 为准：它只列当前可达的物理设备，而 devicectl 的 tunnelState
+# 常在设备正常时误报 disconnected（见 SKILL.md 踩坑 3），只作兜底。
+XTOUT="$RUN_TMP/xctrace.txt"
+xcrun xctrace list devices >"$XTOUT" 2>/dev/null || : >"$XTOUT"
+
+DEV_LIST="$(python3 - "$DEVJSON" "$XTOUT" <<'PY'
+import json, re, sys
+
+# xctrace 输出中 "== Devices ==" 段是可达物理设备，行尾括号内为 UDID；Simulators 与 Offline 需排除
+reachable = set()
+try:
+    in_devices = False
+    for raw in open(sys.argv[2], errors="ignore"):
+        line = raw.strip()
+        if line.startswith("=="):
+            in_devices = ("Devices" in line) and ("Simulators" not in line) and ("Offline" not in line)
+            continue
+        if not in_devices or not line or line.lower().endswith("(offline)"):
+            continue
+        m = re.search(r"\(([0-9A-Fa-f][0-9A-Fa-f-]{7,})\)\s*$", line)
+        if m:
+            reachable.add(m.group(1))
+except OSError:
+    pass
+
 try:
     data = json.load(open(sys.argv[1]))
 except Exception:
@@ -86,36 +113,98 @@ for dev in data.get("result", {}).get("devices", []):
         continue
     name = (hw.get("marketingName") or dp.get("name") or "iPhone").replace("\t", " ")
     paired = "1" if cp.get("pairingState") == "paired" else "0"
-    conn = "1" if cp.get("tunnelState") == "connected" else "0"
-    print(f"{udid}\t{name}\t{paired}\t{conn}")
+    tunnel = "1" if cp.get("tunnelState") == "connected" else "0"
+    online = "1" if (udid in reachable or tunnel == "1") else "0"
+    print(f"{udid}\t{name}\t{paired}\t{online}\t{tunnel}")
 PY
 )"
 
 UDID=""
 DEVNAME=""
-if [[ -n "$DEVICE" ]]; then
-  while IFS=$'\t' read -r u n p c; do
+DEVSRC=""
+
+STATE_DIR="${HOME}/Library/Caches/ios-run"
+LAST_DEV_FILE="$STATE_DIR/last-device"
+
+# IOSRunner.app 每次运行前会把选中的设备写进自己的 UserDefaults（键 deviceUDID）
+APP_PREF_UDID="$(defaults read local.tools.iosrunner deviceUDID 2>/dev/null | head -1 | tr -d '\r')"
+# 本脚本上次成功启动所用的设备，下次自动沿用
+LAST_DEV_UDID="$(cut -f1 "$LAST_DEV_FILE" 2>/dev/null | head -1 | tr -d '\r')"
+
+# pick_device <want> <need_online> <allow_unpaired>
+# want 可匹配 UDID 或设备名；need_online=1 时要求在线；allow_unpaired=1 时不过滤配对状态（用于 -d）
+pick_device() {
+  local want="$1" need="${2:-0}" allow_any="${3:-0}"
+  local hits=0 hit_u="" hit_n=""
+  while IFS=$'\t' read -r u n p o t; do
     [[ -z "$u" ]] && continue
-    if [[ "$u" == "$DEVICE" || "$n" == "$DEVICE" ]]; then
-      UDID="$u"; DEVNAME="$n"; break
+    if [[ "$allow_any" != "1" && "$p" != "1" ]]; then
+      continue
+    fi
+    if [[ "$need" == "1" && "$o" != "1" ]]; then
+      continue
+    fi
+    if [[ "$u" == "$want" || "$n" == "$want" ]]; then
+      hits=$((hits + 1)); hit_u="$u"; hit_n="$n"
     fi
   done <<< "$DEV_LIST"
-  [[ -n "$UDID" ]] || die "找不到设备「${DEVICE}」。可用：$(echo "$DEV_LIST" | awk -F'\t' 'NF{printf "%s(%s) ", $2, $1}')"
-else
-  fallback=""
-  while IFS=$'\t' read -r u n p c; do
+  # 同名设备不止一台时不能猜，否则会把 App 装到没预期的机器上
+  [[ "$hits" -gt 1 ]] && return 2
+  [[ -n "$hit_u" ]] || return 1
+  UDID="$hit_u"; DEVNAME="$hit_n"; return 0
+}
+
+list_devices() {
+  while IFS=$'\t' read -r u n p o t; do
     [[ -z "$u" ]] && continue
-    [[ "$p" != "1" ]] && continue
-    if [[ "$c" == "1" ]]; then UDID="$u"; DEVNAME="$n"; break; fi
-    [[ -z "$fallback" ]] && fallback="$u|$n"
+    local st="未配对"
+    if [[ "$p" == "1" ]]; then
+      if [[ "$o" == "1" ]]; then st="在线"; else st="已配对 · 未连接"; fi
+    fi
+    local mark=""
+    if [[ "$u" == "$APP_PREF_UDID" ]]; then
+      mark="   ← IOSRunner 选中"
+    elif [[ "$u" == "$LAST_DEV_UDID" ]]; then
+      mark="   ← 上次使用"
+    fi
+    echo "  $u  $n  $st$mark"
   done <<< "$DEV_LIST"
-  if [[ -z "$UDID" && -n "$fallback" ]]; then
-    UDID="${fallback%%|*}"; DEVNAME="${fallback##*|}"
-  fi
+}
+
+if [[ $DO_LIST -eq 1 ]]; then
+  list_devices
+  exit 0
+fi
+
+ONLINE_LIST="$(echo "$DEV_LIST" | awk -F'\t' 'NF && $3=="1" && $4=="1"')"
+ONLINE_COUNT="$(printf '%s\n' "$ONLINE_LIST" | grep -c . || true)"
+
+if [[ -n "$DEVICE" ]]; then
+  # 显式指定时不做任何过滤，允许离线/未配对设备，交给 xcodebuild 给出精确诊断
+  pick_device "$DEVICE" 0 1
+  case $? in
+    0) : ;;
+    2) die "有多台设备同名「${DEVICE}」，无法区分。请改用 UDID 指定（--list 可查）" ;;
+    *) die "找不到设备「${DEVICE}」，用 --list 查看可用设备" ;;
+  esac
+  DEVSRC="-d 参数"
+elif [[ -n "$APP_PREF_UDID" ]] && pick_device "$APP_PREF_UDID" 1; then
+  DEVSRC="IOSRunner.app 选择"
+elif [[ -n "$APP_PREF_UDID" ]] && pick_device "$APP_PREF_UDID" 0; then
+  # 用户在 App 里明确选过，不静默换机，避免装到没预期的设备上
+  die "IOSRunner.app 选中的设备「${DEVNAME}」当前未连接。接上这台，或在 App 里换一台，或用 -d 指定"
+elif [[ -n "$LAST_DEV_UDID" ]] && pick_device "$LAST_DEV_UDID" 1; then
+  DEVSRC="上次使用的设备"
+elif [[ "$ONLINE_COUNT" -eq 1 ]]; then
+  pick_device "$(echo "$ONLINE_LIST" | cut -f1 | head -1)" 1 && DEVSRC="唯一在线设备"
+elif [[ "$ONLINE_COUNT" -eq 0 ]]; then
+  die "没有在线的 iPhone（历史配对但已离线的设备不算）。请数据线连接、解锁并信任此电脑"
+else
+  die "检测到 ${ONLINE_COUNT} 台在线设备，无法确定用哪台。请用 -d 指定：$(echo "$ONLINE_LIST" | awk -F'\t' '{printf "%s(%s) ", $2, $1}')"
 fi
 
 if [[ -z "$UDID" ]]; then
-  die "没有已配对的 iPhone。请数据线连接、解锁并信任此电脑"
+  die "没有在线的 iPhone。请数据线连接、解锁并信任此电脑"
 fi
 
 # ---------- 3. 解析 scheme ----------
@@ -181,7 +270,7 @@ diagnose() {
     DIAG="描述文件已过期"; HINT="重新运行即可自动续期（免费账号 7 天）"
   elif grep -qiE 'not been explicitly trusted' "$f"; then
     DIAG="设备未信任开发者证书"; HINT="手机：设置 → 通用 → VPN 与设备管理 → 开发者 App → 信任"
-  elif grep -qiE 'device is locked' "$f"; then
+  elif grep -qiE 'device is locked|not, or could not be, unlocked' "$f"; then
     DIAG="手机锁屏"; HINT="解锁 iPhone 后重试"
   elif grep -qiE 'failed to prepare device for development|developer mode' "$f"; then
     DIAG="设备未开启开发者模式"; HINT="手机：设置 → 隐私与安全性 → 开发者模式"
@@ -265,7 +354,11 @@ LAUNCH_RC=$?
 [[ $LAUNCH_RC -eq 0 ]] || fail "启动" "$LAUNCH_RC"
 T_LAUNCH=$((SECONDS - T2))
 
-# ---------- 8. 成功输出 ----------
+# ---------- 8. 记住本次设备，下次自动沿用 ----------
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+printf '%s\t%s\n' "$UDID" "$DEVNAME" >"$LAST_DEV_FILE" 2>/dev/null || true
+
+# ---------- 9. 成功输出 ----------
 if [[ $JSON -eq 1 ]]; then
   python3 - "$BUNDLE_ID" "$APP" "$UDID" "$DEVNAME" "$SCHEME" "$T_BUILD" "$T_INSTALL" "$T_LAUNCH" <<'PY'
 import json, sys
@@ -282,7 +375,7 @@ print(json.dumps({
 PY
 else
   echo "✔ 编译 ${T_BUILD}s · 安装 ${T_INSTALL}s · 启动 ${T_LAUNCH}s"
-  echo "  设备: $DEVNAME"
+  echo "  设备: $DEVNAME（来源：${DEVSRC}）"
   echo "  Bundle: $BUNDLE_ID"
   echo "  产物: $APP"
 fi

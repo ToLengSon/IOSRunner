@@ -50,7 +50,7 @@ chmod +x ~/.cursor/skills/ios-run/scripts/ios-run.sh
 
 ## 3. 在对话里怎么用
 
-触发方式很自然，只要提到「跑一下 / 运行到手机 / 验证改动 / 编译看看」即可：
+触发方式很自然，只要提到「跑一下 / 运行到手机 / 装到手机上 / 真机调试 / 验证改动 / 编译看看 / 签名报错 / 看不到设备」即可：
 
 ```
 这个按钮颜色改成蓝色，然后跑一下
@@ -166,7 +166,7 @@ bash $S -v                                # 打印完整日志
 1. **destination 必须用 UDID**（`00008110-...`），不是 `devicectl` 输出里的那个 UUID —— 填错会报 destination 找不到
 2. **clean 必须带 `-destination 'generic/platform=iOS'`** —— 否则 xcodebuild 会挑中 `My Mac`，在系统版本不匹配时报错
 3. **CocoaPods 项目自动优先 `.xcworkspace`** —— 用 `.xcodeproj` 会缺 Pods
-4. **设备自动选择** —— 优先已连接，其次已配对；`tunnelState` 会抖动，不作硬性拦截
+4. **设备自动选择** —— `-d` > App 选中 > 上次使用 > 唯一在线；历史配对但已离线的设备不参与计数。「在线」以 `xctrace list devices` 为准，`tunnelState` 会抖动，只作兜底
 5. **derivedData 集中存放** —— `~/Library/Caches/ios-run/<项目>-DerivedData`，不污染项目目录
 6. **日志不刷屏** —— 只在终端输出结论，全量进文件
 
@@ -194,8 +194,8 @@ xcrun devicectl list devices                 # 看到 iPhone
 **说「跑一下」AI 没反应？**
 Skill 未安装或未重启 CodeBuddy。检查 `~/.codebuddy/skills/ios-run/SKILL.md` 是否存在。
 
-**脚本报「没有已配对的 iPhone」**
-数据线连接 → 解锁 → 手机上点「信任此电脑」。
+**脚本报「没有在线的 iPhone」**
+数据线连接 → 解锁 → 手机上点「信任此电脑」。历史配对过但当前不在设备旁的手机不算在线，不会误选。
 
 **手机上 App 7 天后闪退**
 免费账号 profile 过期，重新跑一次即续期。

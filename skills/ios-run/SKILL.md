@@ -7,7 +7,7 @@ description: 在不开 Xcode 的情况下完成 iOS 真机开发闭环——编�
 
 ## 用途
 
-替代打开 Xcode 完成「编译 → 安装到 iPhone → 启动」，并把失败原因翻译成人话。
+替代打开 Xcode 完成「编译 → 安装到 iPhone → 启动」，并把失败原因翻译成人话。  
 适合内存紧张、或希望由 CodeBuddy 独立完成「改代码 → 验证」闭环的场景。
 
 Xcode 本体不需要打开，但必须已安装（提供 `xcodebuild`、iOS SDK、签名能力）。
@@ -24,7 +24,7 @@ Xcode 本体不需要打开，但必须已安装（提供 `xcodebuild`、iOS SDK
 ```bash
 S=<本skill目录>/scripts/ios-run.sh
 
-# 最常用：当前目录找容器，自动选第一台已配对设备
+# 最常用：当前目录找容器，自动选设备（上次用过的 > 唯一在线）
 bash $S
 
 # 指定项目 / 设备 / scheme
@@ -38,6 +38,30 @@ bash $S --clean
 ```
 
 自动化场景优先用 `--json`，只解析需要的字段，避免把几百行构建日志读进上下文。
+
+## 设备是怎么选的
+
+按顺序取第一个可用项，日常「跑一下」不带参数也能确定，不会反问用户：
+
+1. `-d` 指定（可用设备名或 UDID，允许离线，由 `xcodebuild` 给出精确诊断）
+2. `IOSRunner.app` 里选中的设备（离线时直接报错，**不静默换机**，避免装错设备）
+3. 本脚本上次成功启动的设备（仍需在线）
+4. 当前唯一在线的已配对设备
+5. 多台都在线且无历史记录 → 报错并列出候选，此时才需要问用户
+
+「在线」以 `xcrun xctrace list devices` 的可达列表为准，`devicectl` 的 `tunnelState` 只作兜底。**历史配对过、如今已离线的设备不参与计数**，所以配过几台旧设备不会导致每次都要求 `-d`。`--list` 会标出 `← IOSRunner 选中` 和 `← 上次使用`。
+
+### 需要用户选设备时的标准问法
+
+脚本自身不会交互提问，它只以 `stage: setup` 失败退出并列出候选。收到「检测到 N 台在线设备」时**不要自己猜**，先跑 `--list` 拿 UDID，再按下面格式问一次：
+
+> 检测到 2 台 iPhone 在线，需要确认装到哪台：
+> 1. iPhone 13（00008110-…）← 上次使用
+> 2. iPhone 15（00008110-…）
+>
+> 回复序号或设备名即可；想以后不再被问，可在菜单栏 IOSRunner 里选一次。
+
+用户回复后，用 `-d "<名字或 UDID>"` 重跑，**不要在后续轮次重复询问**。若两台同名，必须让用户确认序号并改用 UDID 传参。
 
 ## 标准工作流
 
@@ -93,7 +117,7 @@ JSON：
 
 1. **destination 用 UDID**：形如 `00008110-XXXXXXXXXXXXXXXX`。`devicectl list devices` 输出里的 `XXXXXXXX-...` 是另一个标识，填给 `-destination` 会报找不到。
 2. **clean 必须带 destination**：`-destination 'generic/platform=iOS'`。不带的话 `xcodebuild` 会挑中 `My Mac`，在 macOS 版本不匹配的机器上报 `Xcode doesn't support My Mac's macOS`。
-3. **`tunnelState` 不可靠**：设备正常时也可能显示 `disconnected`。是否可用以 `xcodebuild -showdestinations` 或实际构建结果为准，不要用它做前置拦截。
+3. **`tunnelState` 不可靠**：设备正常时也可能显示 `disconnected`（实测常见）。是否可用以 `xcrun xctrace list devices` 的可达列表为准，其次是 `xcodebuild -showdestinations` 或实际构建结果，不要用它做前置拦截。
 4. **CocoaPods 项目必须用 `.xcworkspace`**：用 `.xcodeproj` 会报一堆 `Pods` 头文件找不到。脚本遇到目录里有 workspace 会自动优先选它。
 5. **产物路径**：`<derivedData>/Build/Products/<Config>-iphoneos/<Scheme>.app`，脚本默认 derivedData 在 `~/Library/Caches/ios-run/<项目名>-DerivedData`。
 6. **免费账号 profile 7 天过期**：手机上的 App 到期会闪退，重新运行一次即自动续期，数据不丢。
