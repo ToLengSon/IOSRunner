@@ -6,8 +6,8 @@
 #   ios-run.sh -p ~/proj/App.xcworkspace -d "iPhone 13"
 #   ios-run.sh --clean --json          # 清理后构建，输出 JSON 供程序解析
 #   ios-run.sh -s MyApp -v             # 指定 scheme 并打印完整日志
-#   ios-run.sh --wait 5                # 启动后等 5s 校验是否闪退（默认 3s，0=不校验）
 #   ios-run.sh --events                # 逐行输出 NDJSON 事件流（供图形界面消费）
+#   ios-run.sh --crash                 # 只取最近的崩溃日志并解析，不构建不安装
 #   设备优先级：-d > IOSRunner.app 选择 > 上次使用(在线) > 唯一在线设备
 set -uo pipefail
 
@@ -20,7 +20,10 @@ DO_LIST=0
 JSON=0
 VERBOSE=0
 EVENTS=0
-WAIT_SECS=3
+# 启动后固定等 2 秒再查一次进程：够发现「启动即崩」，又不会拖慢日常
+VERIFY_SECS=2
+DO_CRASH=0
+CRASH_WINDOW=900
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -32,14 +35,13 @@ while [[ $# -gt 0 ]]; do
     -l|--list)    DO_LIST=1; shift ;;
     --json)       JSON=1; shift ;;
     -v|--verbose) VERBOSE=1; shift ;;
-    -w|--wait)    WAIT_SECS="${2:-3}"; shift 2 ;;
     --events)     EVENTS=1; JSON=1; shift ;;
+    --crash)      DO_CRASH=1; shift ;;
+    --within)     CRASH_WINDOW="${2:-900}"; shift 2 ;;
     -h|--help)    sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "未知参数: $1" >&2; exit 2 ;;
   esac
 done
-
-[[ "$WAIT_SECS" =~ ^[0-9]+$ ]] || WAIT_SECS=3
 
 RUN_TMP="$(mktemp -d)"
 # 日志固定路径实时写入：图形界面可以直接 tail 这个文件显示构建进度
@@ -250,9 +252,261 @@ fi
 [[ -n "$SCHEME" ]] || die "无法确定 scheme，请用 -s 指定"
 [[ "$SCHEME" == "$CONTAINER_NAME" ]] || true
 
+crash_report() {
+  # 从设备拉崩溃日志，解析异常类型、原因与出错帧（有 dSYM 时顺带符号化）
+  local dest="$RUN_TMP/crash"
+  local saved="$STATE_DIR/crash"
+  mkdir -p "$saved" 2>/dev/null || true
+  # 复制失败通常意味着设备掉线/锁屏，要和「没有崩溃日志」区分开
+  xcrun devicectl device copy from --device "$UDID" --domain-type systemCrashLogs \
+    --source . --destination "$dest" --quiet >/dev/null 2>&1 \
+    || { echo "COPYFAILED\t1"; return 0; }
+
+  python3 - "$dest" "$EXEC_NAME" "${APP}.dSYM/Contents/Resources/DWARF/${EXEC_NAME}" "$saved" "$APP/$EXEC_NAME" <<'PY'
+import glob, json, os, re, shutil, subprocess, sys, time
+
+root, app_name, dsym, saved, appbin = sys.argv[1:6]
+# 优先 dSYM；没有时退回 app 内未 strip 的二进制
+symbol_sources = [p for p in (dsym, appbin) if os.path.exists(p)]
+
+def load(f):
+    raw = open(f, errors="ignore").read()
+    head, _, body = raw.partition("\n")
+    try:
+        meta = json.loads(head)
+    except Exception:
+        meta = {}
+    try:
+        data = json.loads(body)
+    except Exception:
+        data = None
+    return (meta if isinstance(meta, dict) else {}), (data if isinstance(data, dict) else None)
+
+cands = []
+for f in glob.glob(os.path.join(root, "**", "*.ips"), recursive=True):
+    try:
+        cands.append((os.path.getmtime(f), f))
+    except OSError:
+        pass
+cands.sort(reverse=True)
+
+# 系统里混着大量 diskwrites_resource 之类的统计报告，第二段不是 JSON，只能按内容筛真正的崩溃报告
+best = None
+fallback = None
+now = time.time()
+try:
+    window = int(os.environ.get("IOSRUN_CRASH_WINDOW") or "300")
+except ValueError:
+    window = 300
+for mtime, f in cands[:300]:
+    meta, data = load(f)
+    if data is None:
+        continue
+    if "exception" not in data and "termination" not in data:
+        continue
+    label = f"{meta.get('app_name') or ''} {os.path.basename(f)}".lower()
+    if app_name and app_name.lower() in label:
+        best = (meta, data, f)
+        break
+    # 兜底只接受时间窗内的崩溃，避免把陈年系统崩溃当成这次的问题
+    if fallback is None and (window <= 0 or now - mtime < window):
+        fallback = (meta, data, f)
+
+chosen = best or fallback
+if not chosen:
+    print("CRASHFILE\t")
+    sys.exit(0)
+
+meta, data, path = chosen
+kept = path
+try:
+    kept = os.path.join(saved, os.path.basename(path))
+    shutil.copy(path, kept)
+except Exception:
+    kept = path
+
+exc = data.get("exception") or {}
+term = data.get("termination") or {}
+images = data.get("usedImages") or []
+
+def symbolize(image_index, offset):
+    if not symbol_sources or not isinstance(image_index, int) or image_index >= len(images):
+        return ""
+    img = images[image_index]
+    if not isinstance(img, dict):
+        return ""
+    base = img.get("base")
+    arch = img.get("arch") or "arm64"
+    if not isinstance(base, int):
+        return ""
+    for src in symbol_sources:
+        try:
+            out = subprocess.run(
+                ["atos", "-arch", arch, "-o", src, "-l", hex(base), hex(base + offset)],
+                capture_output=True, text=True, timeout=15)
+            text = out.stdout.strip()
+            # 符号化失败时 atos 只回显 "0x... (in Foo)"，没有任何函数名
+            if text and not re.match(r"^0x[0-9a-fA-F]+ \(in ", text):
+                return text
+        except Exception:
+            continue
+    return ""
+
+# NSException 类闪退要读 lastExceptionBacktrace：faultingThread 那几条通常只是
+# abort / pthread_kill，看不出业务代码在哪
+frames = []
+leb = data.get("lastExceptionBacktrace")
+if isinstance(leb, list) and leb:
+    frames = leb
+else:
+    threads = data.get("threads") or []
+    ft = data.get("faultingThread")
+    for i, th in enumerate(threads):
+        if th.get("triggered") or (isinstance(ft, int) and i == ft):
+            frames = th.get("frames") or []
+            break
+
+def emit(tag, value):
+    if value:
+        print(f"{tag}\t{str(value).replace(chr(9), ' ')}")
+
+# exceptionReason.composed_message 是 NSException 的完整原因，比 termination 具体得多
+er = data.get("exceptionReason")
+reason = ""
+if isinstance(er, dict):
+    reason = er.get("composed_message") or ""
+elif isinstance(er, str):
+    reason = er
+if not reason:
+    reason = " / ".join(term.get("reasons") or []) or term.get("indicator") or ""
+
+emit("EXCTYPE", exc.get("type") or "")
+emit("SIGNAL", exc.get("signal") or "")
+emit("REASON", reason)
+emit("CRASHFILE", kept)
+
+app_idx = set()
+for i, img in enumerate(images):
+    if not isinstance(img, dict):
+        continue
+    nm = (img.get("name") or "").lower()
+    pth = (img.get("path") or "").lower()
+    if app_name and app_name.lower() in (nm + " " + pth):
+        app_idx.add(i)
+
+def render(fr):
+    idx = fr.get("imageIndex")
+    off = fr.get("imageOffset") or 0
+    sym = fr.get("symbol") or ""
+    loc = fr.get("symbolLocation")
+    src = fr.get("sourceFile") or ""
+    line = fr.get("sourceLine")
+    img_name = ""
+    if isinstance(idx, int) and idx < len(images) and isinstance(images[idx], dict):
+        img_name = images[idx].get("name") or ""
+    # App 帧即使已带方法名，也要用 dSYM 补出 文件:行
+    if isinstance(idx, int) and idx in app_idx:
+        resolved = symbolize(idx, off)
+        if resolved:
+            return resolved
+    if not sym and isinstance(idx, int):
+        sym = symbolize(idx, off)
+    where = f"{os.path.basename(src)}:{line}" if (src and line) else ""
+    text = where
+    if sym:
+        text = (text + "  " if text else "") + sym + (f" + {loc}" if loc else "")
+    if not text:
+        # App 帧常常不带符号，必须有 dSYM 才能还原成 文件:行
+        text = f"{img_name or ('image[%s]' % idx)} + {off}（未符号化，缺 dSYM）"
+    return text
+
+# App 自己的帧才指向代码，优先输出；系统库帧作为上下文补几条
+own = [fr for fr in frames if isinstance(fr, dict) and fr.get("imageIndex") in app_idx]
+others = [fr for fr in frames if isinstance(fr, dict) and fr.get("imageIndex") not in app_idx]
+for shown, fr in enumerate(own[:3] + others[:3]):
+    print(f"FRAME{shown}\t{render(fr)}")
+PY
+}
+
 DERIVED="$HOME/Library/Caches/ios-run/$CONTAINER_NAME-DerivedData"
 mkdir -p "$DERIVED"
 APP="$DERIVED/Build/Products/$CONFIG-iphoneos/$SCHEME.app"
+
+# ---------- 3.5 只查崩溃日志（不构建不安装） ----------
+# 用于「App 已经崩了，现在想知道为什么」的场景，不依赖启动后那几秒的存活校验
+if [[ $DO_CRASH -eq 1 ]]; then
+  EXEC_NAME=""
+  if [[ -f "$APP/Info.plist" ]]; then
+    EXEC_NAME="$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "$APP/Info.plist" 2>/dev/null)"
+  fi
+  [[ -n "$EXEC_NAME" ]] || EXEC_NAME="$SCHEME"
+
+  ev stage "取崩溃日志"
+  [[ $JSON -eq 0 ]] && echo "▸ 从 $DEVNAME 取最近的崩溃日志（窗口 ${CRASH_WINDOW}s）"
+
+  SUMMARY="$RUN_TMP/crash.txt"
+  IOSRUN_CRASH_WINDOW="$CRASH_WINDOW" crash_report > "$SUMMARY"
+
+  if grep -q '^COPYFAILED' "$SUMMARY" 2>/dev/null; then
+    die "无法读取设备上的崩溃日志：设备可能已断开或锁屏，请解锁并重新连接后重试"
+  fi
+
+  EXCTYPE="$(awk -F'\t' '$1=="EXCTYPE"{print $2}' "$SUMMARY" 2>/dev/null | head -1)"
+  REASON="$(awk -F'\t' '$1=="REASON"{print $2}' "$SUMMARY" 2>/dev/null | head -1)"
+  CRASHFILE="$(awk -F'\t' '$1=="CRASHFILE"{print $2}' "$SUMMARY" 2>/dev/null | head -1)"
+  FRAMES="$(awk -F'\t' '$1 ~ /^FRAME/ {print $2}' "$SUMMARY" 2>/dev/null)"
+
+  if [[ -z "$CRASHFILE" ]]; then
+    if [[ $JSON -eq 1 ]]; then
+      python3 -c 'import json,os,sys; print(json.dumps({"result":"failure","stage":"crash","diagnosis":"时间窗内没有崩溃日志","hint":"确认 App 确实闪退过；或用 --within 放宽窗口（秒，0=不限）","errors":[],"device":{"name":sys.argv[2],"udid":sys.argv[1]}},ensure_ascii=False,indent=None if os.environ.get("IOSRUN_COMPACT")=="1" else 1))' "$UDID" "$DEVNAME"
+    else
+      echo "✘ 时间窗内没有找到崩溃日志（${CRASH_WINDOW}s）"
+      echo "  提示: 用 --within 3600 放宽窗口，或确认 App 确实闪退过"
+    fi
+    exit 1
+  fi
+
+  if [[ $JSON -eq 1 ]]; then
+    python3 - "$SUMMARY" "$UDID" "$DEVNAME" "$SCHEME" <<'PY'
+import json, os, sys
+summary, udid, name, scheme = sys.argv[1:5]
+info, frames = {}, []
+try:
+    for line in open(summary, errors="ignore"):
+        line = line.rstrip("\n")
+        if "\t" not in line:
+            continue
+        k, v = line.split("\t", 1)
+        if k.startswith("FRAME"):
+            frames.append(v)
+        else:
+            info[k] = v
+except Exception:
+    pass
+diag = "闪退" + (f"（{info['EXCTYPE']}）" if info.get("EXCTYPE") else "")
+print(json.dumps({
+    "result": "success",
+    "stage": "crash",
+    "diagnosis": diag,
+    "reason": info.get("REASON") or None,
+    "frames": frames,
+    "crashReport": info.get("CRASHFILE") or None,
+    "scheme": scheme,
+    "device": {"name": name, "udid": udid},
+}, ensure_ascii=False, indent=None if os.environ.get("IOSRUN_COMPACT") == "1" else 1))
+PY
+  else
+    echo "✔ 找到崩溃日志"
+    [[ -n "$EXCTYPE" ]] && echo "  类型: ${EXCTYPE}"
+    [[ -n "$REASON" ]] && echo "  原因: ${REASON}"
+    if [[ -n "$FRAMES" ]]; then
+      echo "  崩溃栈:"
+      echo "$FRAMES" | sed 's/^/    /'
+    fi
+    echo "  报告: ${CRASHFILE}"
+  fi
+  exit 0
+fi
 
 : > "$LOG"
 T_START=$SECONDS
@@ -387,10 +641,10 @@ T_LAUNCH=$((SECONDS - T2))
 ALIVE=""
 EXEC_NAME="$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "$APP/Info.plist" 2>/dev/null)"
 [[ -n "$EXEC_NAME" ]] || EXEC_NAME="$(basename "$APP" .app)"
-if [[ "$WAIT_SECS" -gt 0 ]]; then
+if [[ "$VERIFY_SECS" -gt 0 ]]; then
   ev stage "校验"
-  [[ $JSON -eq 0 ]] && echo "▸ 等待 ${WAIT_SECS}s，确认进程没有闪退"
-  sleep "$WAIT_SECS"
+  [[ $JSON -eq 0 ]] && echo "▸ 等待 ${VERIFY_SECS}s，确认进程没有闪退"
+  sleep "$VERIFY_SECS"
   PROCS="$RUN_TMP/procs.json"
   xcrun devicectl device info processes --device "$UDID" --json-output "$PROCS" --quiet >/dev/null 2>&1
   # 查询失败（设备掉线等）时不做判断，避免把「查不到」误报成闪退
@@ -404,175 +658,6 @@ if [[ "$WAIT_SECS" -gt 0 ]]; then
   fi
 fi
 
-crash_report() {
-  # 从设备拉崩溃日志，解析异常类型、原因与出错帧（有 dSYM 时顺带符号化）
-  local dest="$RUN_TMP/crash"
-  local saved="$STATE_DIR/crash"
-  mkdir -p "$saved" 2>/dev/null || true
-  xcrun devicectl device copy from --device "$UDID" --domain-type systemCrashLogs \
-    --source . --destination "$dest" --quiet >/dev/null 2>&1 || true
-
-  python3 - "$dest" "$EXEC_NAME" "${APP}.dSYM/Contents/Resources/DWARF/${EXEC_NAME}" "$saved" "$APP/$EXEC_NAME" <<'PY'
-import glob, json, os, re, shutil, subprocess, sys, time
-
-root, app_name, dsym, saved, appbin = sys.argv[1:6]
-# 优先 dSYM；没有时退回 app 内未 strip 的二进制
-symbol_sources = [p for p in (dsym, appbin) if os.path.exists(p)]
-
-def load(f):
-    raw = open(f, errors="ignore").read()
-    head, _, body = raw.partition("\n")
-    try:
-        meta = json.loads(head)
-    except Exception:
-        meta = {}
-    try:
-        data = json.loads(body)
-    except Exception:
-        data = None
-    return (meta if isinstance(meta, dict) else {}), (data if isinstance(data, dict) else None)
-
-cands = []
-for f in glob.glob(os.path.join(root, "**", "*.ips"), recursive=True):
-    try:
-        cands.append((os.path.getmtime(f), f))
-    except OSError:
-        pass
-cands.sort(reverse=True)
-
-# 系统里混着大量 diskwrites_resource 之类的统计报告，第二段不是 JSON，只能按内容筛真正的崩溃报告
-best = None
-fallback = None
-now = time.time()
-for mtime, f in cands[:300]:
-    meta, data = load(f)
-    if data is None:
-        continue
-    if "exception" not in data and "termination" not in data:
-        continue
-    label = f"{meta.get('app_name') or ''} {os.path.basename(f)}".lower()
-    if app_name and app_name.lower() in label:
-        best = (meta, data, f)
-        break
-    # 兜底只接受 5 分钟内的崩溃，避免把陈年系统崩溃当成这次的问题
-    if fallback is None and now - mtime < 300:
-        fallback = (meta, data, f)
-
-chosen = best or fallback
-if not chosen:
-    print("CRASHFILE\t")
-    sys.exit(0)
-
-meta, data, path = chosen
-kept = path
-try:
-    kept = os.path.join(saved, os.path.basename(path))
-    shutil.copy(path, kept)
-except Exception:
-    kept = path
-
-exc = data.get("exception") or {}
-term = data.get("termination") or {}
-images = data.get("usedImages") or []
-
-def symbolize(image_index, offset):
-    if not symbol_sources or not isinstance(image_index, int) or image_index >= len(images):
-        return ""
-    img = images[image_index]
-    if not isinstance(img, dict):
-        return ""
-    base = img.get("base")
-    arch = img.get("arch") or "arm64"
-    if not isinstance(base, int):
-        return ""
-    for src in symbol_sources:
-        try:
-            out = subprocess.run(
-                ["atos", "-arch", arch, "-o", src, "-l", hex(base), hex(base + offset)],
-                capture_output=True, text=True, timeout=15)
-            text = out.stdout.strip()
-            # 符号化失败时 atos 只回显 "0x... (in Foo)"，没有任何函数名
-            if text and not re.match(r"^0x[0-9a-fA-F]+ \(in ", text):
-                return text
-        except Exception:
-            continue
-    return ""
-
-# NSException 类闪退要读 lastExceptionBacktrace：faultingThread 那几条通常只是
-# abort / pthread_kill，看不出业务代码在哪
-frames = []
-leb = data.get("lastExceptionBacktrace")
-if isinstance(leb, list) and leb:
-    frames = leb
-else:
-    threads = data.get("threads") or []
-    ft = data.get("faultingThread")
-    for i, th in enumerate(threads):
-        if th.get("triggered") or (isinstance(ft, int) and i == ft):
-            frames = th.get("frames") or []
-            break
-
-def emit(tag, value):
-    if value:
-        print(f"{tag}\t{str(value).replace(chr(9), ' ')}")
-
-# exceptionReason.composed_message 是 NSException 的完整原因，比 termination 具体得多
-er = data.get("exceptionReason")
-reason = ""
-if isinstance(er, dict):
-    reason = er.get("composed_message") or ""
-elif isinstance(er, str):
-    reason = er
-if not reason:
-    reason = " / ".join(term.get("reasons") or []) or term.get("indicator") or ""
-
-emit("EXCTYPE", exc.get("type") or "")
-emit("SIGNAL", exc.get("signal") or "")
-emit("REASON", reason)
-emit("CRASHFILE", kept)
-
-app_idx = set()
-for i, img in enumerate(images):
-    if not isinstance(img, dict):
-        continue
-    nm = (img.get("name") or "").lower()
-    pth = (img.get("path") or "").lower()
-    if app_name and app_name.lower() in (nm + " " + pth):
-        app_idx.add(i)
-
-def render(fr):
-    idx = fr.get("imageIndex")
-    off = fr.get("imageOffset") or 0
-    sym = fr.get("symbol") or ""
-    loc = fr.get("symbolLocation")
-    src = fr.get("sourceFile") or ""
-    line = fr.get("sourceLine")
-    img_name = ""
-    if isinstance(idx, int) and idx < len(images) and isinstance(images[idx], dict):
-        img_name = images[idx].get("name") or ""
-    # App 帧即使已带方法名，也要用 dSYM 补出 文件:行
-    if isinstance(idx, int) and idx in app_idx:
-        resolved = symbolize(idx, off)
-        if resolved:
-            return resolved
-    if not sym and isinstance(idx, int):
-        sym = symbolize(idx, off)
-    where = f"{os.path.basename(src)}:{line}" if (src and line) else ""
-    text = where
-    if sym:
-        text = (text + "  " if text else "") + sym + (f" + {loc}" if loc else "")
-    if not text:
-        # App 帧常常不带符号，必须有 dSYM 才能还原成 文件:行
-        text = f"{img_name or ('image[%s]' % idx)} + {off}（未符号化，缺 dSYM）"
-    return text
-
-# App 自己的帧才指向代码，优先输出；系统库帧作为上下文补几条
-own = [fr for fr in frames if isinstance(fr, dict) and fr.get("imageIndex") in app_idx]
-others = [fr for fr in frames if isinstance(fr, dict) and fr.get("imageIndex") not in app_idx]
-for shown, fr in enumerate(own[:3] + others[:3]):
-    print(f"FRAME{shown}\t{render(fr)}")
-PY
-}
 
 if [[ "$ALIVE" == "0" ]]; then
   SUMMARY="$RUN_TMP/crash.txt"
@@ -587,7 +672,7 @@ if [[ "$ALIVE" == "0" ]]; then
   cp "$LOG" "$LASTLOG" 2>/dev/null || true
 
   if [[ $JSON -eq 1 ]]; then
-    python3 - "$SUMMARY" "$BUNDLE_ID" "$UDID" "$DEVNAME" "$SCHEME" "$LASTLOG" "$WAIT_SECS" <<'PY'
+    python3 - "$SUMMARY" "$BUNDLE_ID" "$UDID" "$DEVNAME" "$SCHEME" "$LASTLOG" "$VERIFY_SECS" <<'PY'
 import json, os, sys
 summary, bundle, udid, name, scheme, log, wait = sys.argv[1:8]
 info, frames = {}, []
@@ -620,7 +705,7 @@ print(json.dumps({
 }, ensure_ascii=False, indent=None if os.environ.get("IOSRUN_COMPACT") == "1" else 1))
 PY
   else
-    echo "✘ 运行失败：启动后 ${WAIT_SECS}s 内退出（闪退）"
+    echo "✘ 运行失败：启动后 ${VERIFY_SECS}s 内退出（闪退）"
     echo "  诊断: ${DIAG}"
     [[ -n "$REASON" ]] && echo "  原因: ${REASON}"
     echo "  建议: ${HINT}"
@@ -642,7 +727,7 @@ printf '%s\t%s\n' "$UDID" "$DEVNAME" >"$LAST_DEV_FILE" 2>/dev/null || true
 
 # ---------- 10. 成功输出 ----------
 if [[ $JSON -eq 1 ]]; then
-  python3 - "$BUNDLE_ID" "$APP" "$UDID" "$DEVNAME" "$SCHEME" "$T_BUILD" "$T_INSTALL" "$T_LAUNCH" "$ALIVE" "$WAIT_SECS" <<'PY'
+  python3 - "$BUNDLE_ID" "$APP" "$UDID" "$DEVNAME" "$SCHEME" "$T_BUILD" "$T_INSTALL" "$T_LAUNCH" "$ALIVE" "$VERIFY_SECS" <<'PY'
 import json, os, sys
 bundle, app, udid, name, scheme, tb, ti, tl, alive, wait = sys.argv[1:11]
 print(json.dumps({
@@ -660,7 +745,7 @@ PY
 else
   echo "✔ 编译 ${T_BUILD}s · 安装 ${T_INSTALL}s · 启动 ${T_LAUNCH}s"
   if [[ "$ALIVE" == "1" ]]; then
-    echo "  运行: 正常（已存活 ${WAIT_SECS}s）"
+    echo "  运行: 正常（已存活 ${VERIFY_SECS}s）"
   elif [[ "$ALIVE" == "0" ]]; then
     echo "  运行: 未知"
   else
