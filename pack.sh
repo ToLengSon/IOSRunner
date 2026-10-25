@@ -32,7 +32,7 @@ rm -rf "$OUT" "$ZIP"
 mkdir -p "$OUT/skills"
 
 cp -R dist/IOSRunner.app "$OUT/"
-cp install.sh README.md 使用手册.md Skill-使用手册.md "$OUT/"
+cp install.sh README.md 使用手册.md Skill-使用手册.md RELEASE_NOTES.md "$OUT/"
 cp -R "$LOCAL_SKILL" "$OUT/skills/"
 
 chmod +x "$OUT/install.sh" "$OUT/skills/ios-run/scripts/ios-run.sh"

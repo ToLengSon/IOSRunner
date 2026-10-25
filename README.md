@@ -11,6 +11,7 @@
 | `install.sh`      | 一键安装上面两样 + 环境检查                                              |
 | `使用手册.md`         | 工具详细手册（界面、排障、命令速查）                                           |
 | `Skill-使用手册.md`   | Skill 的安装、对话用法、参数与输出解读                                       |
+| `RELEASE_NOTES.md` | 版本说明：能力清单、环境要求、已知限制                                       |
 
 两者互不依赖，**按你的习惯选一个用即可**：
 
@@ -46,6 +47,7 @@ pack.sh             打包完整分发包
 install.sh          安装到本机
 使用手册.md         工具手册
 Skill-使用手册.md   Skill 手册
+RELEASE_NOTES.md    版本说明
 ```
 
 安装位置：
@@ -112,4 +114,4 @@ bash ~/.codebuddy/skills/ios-run/scripts/ios-run.sh -p ~/项目/App.xcworkspace
 
 ---
 
-详细内容见 [`使用手册.md`](使用手册.md)（工具）与 [`Skill-使用手册.md`](Skill-使用手册.md)（Skill）。
+详细内容见 [`使用手册.md`](使用手册.md)（工具）与 [`Skill-使用手册.md`](Skill-使用手册.md)（Skill），版本能力见 [`RELEASE_NOTES.md`](RELEASE_NOTES.md)。
