@@ -85,16 +85,36 @@ bash $S --clean                           # 先清理再构建
 bash $S --config Release                  # 默认 Debug
 bash $S --json                            # 机器可读输出
 bash $S -v                                # 打印完整日志
+bash $S --wait 5                          # 启动后等 5s 判闪退（默认 3s，0 关闭）
 ```
 
 ### 成功输出
 
 ```
 ✔ 编译 6s · 安装 3s · 启动 0s
+  运行: 正常（已存活 3s）
   设备: iPhone 13
   Bundle: study.Test.bbc
   产物: ~/Library/Caches/ios-run/Test-DerivedData/Build/Products/Debug-iphoneos/Test.app
 ```
+
+### 闪退输出（不需要 Xcode）
+
+启动后自动回查进程，秒退会被识别成 `stage: 运行`，并从设备拉崩溃日志解析出出错行：
+
+```
+✘ 运行失败：启动后 12s 内退出（闪退）
+  诊断: 运行中闪退（EXC_CRASH）
+  原因: *** -[__NSArray0 objectAtIndex:]: index 3 beyond bounds for empty array
+  建议: 按崩溃帧里的 文件:行 定位并修复，然后重跑；若帧全在系统库，看 原因 里的异常信息
+  崩溃栈:
+    -[ViewController crashNow] (in Test) (ViewController.m:219)
+    main (in Test) (main.m:17)
+    __exceptionPreprocess + 164
+  崩溃报告: ~/Library/Caches/ios-run/crash/Test-2026-10-25-121854.ips
+```
+
+点按钮才触发的闪退，3 秒不够，用 `--wait 30` 留出操作时间。
 
 ### 失败输出
 
@@ -169,6 +189,7 @@ bash $S -v                                # 打印完整日志
 4. **设备自动选择** —— `-d` > App 选中 > 上次使用 > 唯一在线；历史配对但已离线的设备不参与计数。「在线」以 `xctrace list devices` 为准，`tunnelState` 会抖动，只作兜底
 5. **derivedData 集中存放** —— `~/Library/Caches/ios-run/<项目>-DerivedData`，不污染项目目录
 6. **日志不刷屏** —— 只在终端输出结论，全量进文件
+7. **启动即闪退能识别** —— `launch` 返回 0 不代表启动成功，脚本默认等 3s 回查进程；秒退时自动从设备 `systemCrashLogs` 域拉 `.ips`，解析异常类型与出错帧（有 dSYM 时用 `atos` 符号化），全程不开 Xcode
 
 ## 7. 环境要求
 
@@ -199,6 +220,9 @@ Skill 未安装或未重启 CodeBuddy。检查 `~/.codebuddy/skills/ios-run/SKIL
 
 **手机上 App 7 天后闪退**
 免费账号 profile 过期，重新跑一次即续期。
+
+**装完打开就闪退**
+脚本会自动识别为 `stage: 运行` 并给出崩溃帧。完整崩溃报告在 `~/Library/Caches/ios-run/crash/`，可直接 `open` 该目录查看。若输出里没有「运行:」这一行，说明 skill 是旧版，重新安装即可。
 
 **第一次装到新手机打不开**
 手机上信任证书：设置 → 通用 → VPN 与设备管理 → 开发者 App → 信任。

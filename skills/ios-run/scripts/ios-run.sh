@@ -6,6 +6,8 @@
 #   ios-run.sh -p ~/proj/App.xcworkspace -d "iPhone 13"
 #   ios-run.sh --clean --json          # 清理后构建，输出 JSON 供程序解析
 #   ios-run.sh -s MyApp -v             # 指定 scheme 并打印完整日志
+#   ios-run.sh --wait 5                # 启动后等 5s 校验是否闪退（默认 3s，0=不校验）
+#   ios-run.sh --events                # 逐行输出 NDJSON 事件流（供图形界面消费）
 #   设备优先级：-d > IOSRunner.app 选择 > 上次使用(在线) > 唯一在线设备
 set -uo pipefail
 
@@ -17,6 +19,8 @@ DO_CLEAN=0
 DO_LIST=0
 JSON=0
 VERBOSE=0
+EVENTS=0
+WAIT_SECS=3
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -28,19 +32,38 @@ while [[ $# -gt 0 ]]; do
     -l|--list)    DO_LIST=1; shift ;;
     --json)       JSON=1; shift ;;
     -v|--verbose) VERBOSE=1; shift ;;
-    -h|--help)    sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -w|--wait)    WAIT_SECS="${2:-3}"; shift 2 ;;
+    --events)     EVENTS=1; JSON=1; shift ;;
+    -h|--help)    sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "未知参数: $1" >&2; exit 2 ;;
   esac
 done
 
+[[ "$WAIT_SECS" =~ ^[0-9]+$ ]] || WAIT_SECS=3
+
 RUN_TMP="$(mktemp -d)"
-LOG="$RUN_TMP/xcodebuild.log"
+# 日志固定路径实时写入：图形界面可以直接 tail 这个文件显示构建进度
 LASTLOG="${TMPDIR:-/tmp}/ios-run-last.log"
+LOG="$LASTLOG"
+: > "$LOG" 2>/dev/null || { LOG="$RUN_TMP/xcodebuild.log"; : > "$LOG"; }
 trap 'rm -rf "$RUN_TMP"' EXIT
+
+# events 模式：stdout 只出 NDJSON，最终结果用单行 JSON，方便界面逐行解析
+if [[ $EVENTS -eq 1 ]]; then
+  export IOSRUN_COMPACT=1
+  printf '{"event":"logpath","path":"%s"}\n' "$LOG"
+fi
+
+ev() {
+  [[ $EVENTS -eq 1 ]] || return 0
+  case "$1" in
+    stage) printf '{"event":"stage","name":"%s"}\n' "$2" ;;
+  esac
+}
 
 die() {
   if [[ $JSON -eq 1 ]]; then
-    python3 -c 'import json,sys; print(json.dumps({"result":"failure","stage":"setup","diagnosis":sys.argv[1],"hint":None,"errors":[],"log":None},ensure_ascii=False,indent=1))' "$1"
+    python3 -c 'import json,os,sys; print(json.dumps({"result":"failure","stage":"setup","diagnosis":sys.argv[1],"hint":None,"errors":[],"log":None},ensure_ascii=False,indent=None if os.environ.get("IOSRUN_COMPACT")=="1" else 1))' "$1"
   else
     echo "✘ $1" >&2
   fi
@@ -210,7 +233,7 @@ fi
 # ---------- 3. 解析 scheme ----------
 if [[ -z "$SCHEME" ]]; then
   SCHEME="$(xcrun xcodebuild -list -json "${CF[@]}" 2>/dev/null | python3 -c '
-import json, sys
+import json, os, sys
 raw = sys.stdin.read()
 i = raw.find("{")
 if i < 0: sys.exit(0)
@@ -242,9 +265,12 @@ if [[ $DO_CLEAN -eq 1 ]]; then
 fi
 
 # ---------- 5. 编译 ----------
+ev stage "编译"
 [[ $JSON -eq 0 ]] && echo "▸ 编译 ${SCHEME}（${CONFIG}）→ ${DEVNAME}"
+# 强制生成 dSYM：Debug 默认是 dwarf，二进制会被 strip，闪退栈无法还原成 文件:行
 xcrun xcodebuild "${CF[@]}" -scheme "$SCHEME" -configuration "$CONFIG" \
   -destination "id=$UDID" -derivedDataPath "$DERIVED" \
+  DEBUG_INFORMATION_FORMAT=dwarf-with-dsym \
   -allowProvisioningUpdates build >>"$LOG" 2>&1
 BUILD_RC=$?
 T_BUILD=$((SECONDS - T_START))
@@ -294,7 +320,7 @@ fail() {
 
   if [[ $JSON -eq 1 ]]; then
     python3 - "$stage" "$rc" "$DIAG" "$HINT" "$LASTLOG" "$UDID" "$DEVNAME" "$SCHEME" "$CONTAINER" <<'PY'
-import json, sys
+import json, os, sys
 stage, rc, diag, hint, log, udid, name, scheme, container = sys.argv[1:10]
 errors = []
 try:
@@ -315,7 +341,7 @@ print(json.dumps({
     "container": container,
     "device": {"name": name, "udid": udid},
     "log": log,
-}, ensure_ascii=False, indent=1))
+}, ensure_ascii=False, indent=None if os.environ.get("IOSRUN_COMPACT") == "1" else 1))
 PY
   else
     echo "✘ ${stage}失败（耗时 $((SECONDS - T_START))s）"
@@ -336,6 +362,7 @@ PY
 [[ -d "$APP" ]] || fail "编译" 1
 
 # ---------- 6. 安装 ----------
+ev stage "安装"
 [[ $JSON -eq 0 ]] && echo "▸ 安装到 $DEVNAME"
 T1=$SECONDS
 xcrun devicectl device install app --device "$UDID" "$APP" >>"$LOG" 2>&1
@@ -347,6 +374,7 @@ T_INSTALL=$((SECONDS - T1))
 BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$APP/Info.plist" 2>/dev/null)"
 [[ -n "$BUNDLE_ID" ]] || fail "启动" 1
 
+ev stage "启动"
 [[ $JSON -eq 0 ]] && echo "▸ 启动 $BUNDLE_ID"
 T2=$SECONDS
 xcrun devicectl device process launch --device "$UDID" --terminate-existing "$BUNDLE_ID" >>"$LOG" 2>&1
@@ -354,15 +382,269 @@ LAUNCH_RC=$?
 [[ $LAUNCH_RC -eq 0 ]] || fail "启动" "$LAUNCH_RC"
 T_LAUNCH=$((SECONDS - T2))
 
-# ---------- 8. 记住本次设备，下次自动沿用 ----------
+# ---------- 8. 存活校验：区分「启动成功」与「启动即闪退」 ----------
+# launch 只保证启动请求被接受，App 秒退它也会返回 0，必须回查进程是否还在
+ALIVE=""
+EXEC_NAME="$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "$APP/Info.plist" 2>/dev/null)"
+[[ -n "$EXEC_NAME" ]] || EXEC_NAME="$(basename "$APP" .app)"
+if [[ "$WAIT_SECS" -gt 0 ]]; then
+  ev stage "校验"
+  [[ $JSON -eq 0 ]] && echo "▸ 等待 ${WAIT_SECS}s，确认进程没有闪退"
+  sleep "$WAIT_SECS"
+  PROCS="$RUN_TMP/procs.json"
+  xcrun devicectl device info processes --device "$UDID" --json-output "$PROCS" --quiet >/dev/null 2>&1
+  # 查询失败（设备掉线等）时不做判断，避免把「查不到」误报成闪退
+  # 注意字段名是 runningProcesses，executable 形如 file:///.../Foo.app/Foo
+  if [[ -f "$PROCS" ]] && grep -q '"runningProcesses"' "$PROCS" 2>/dev/null; then
+    if grep -qF "/${EXEC_NAME}.app/${EXEC_NAME}" "$PROCS" 2>/dev/null; then
+      ALIVE=1
+    else
+      ALIVE=0
+    fi
+  fi
+fi
+
+crash_report() {
+  # 从设备拉崩溃日志，解析异常类型、原因与出错帧（有 dSYM 时顺带符号化）
+  local dest="$RUN_TMP/crash"
+  local saved="$STATE_DIR/crash"
+  mkdir -p "$saved" 2>/dev/null || true
+  xcrun devicectl device copy from --device "$UDID" --domain-type systemCrashLogs \
+    --source . --destination "$dest" --quiet >/dev/null 2>&1 || true
+
+  python3 - "$dest" "$EXEC_NAME" "${APP}.dSYM/Contents/Resources/DWARF/${EXEC_NAME}" "$saved" "$APP/$EXEC_NAME" <<'PY'
+import glob, json, os, re, shutil, subprocess, sys, time
+
+root, app_name, dsym, saved, appbin = sys.argv[1:6]
+# 优先 dSYM；没有时退回 app 内未 strip 的二进制
+symbol_sources = [p for p in (dsym, appbin) if os.path.exists(p)]
+
+def load(f):
+    raw = open(f, errors="ignore").read()
+    head, _, body = raw.partition("\n")
+    try:
+        meta = json.loads(head)
+    except Exception:
+        meta = {}
+    try:
+        data = json.loads(body)
+    except Exception:
+        data = None
+    return (meta if isinstance(meta, dict) else {}), (data if isinstance(data, dict) else None)
+
+cands = []
+for f in glob.glob(os.path.join(root, "**", "*.ips"), recursive=True):
+    try:
+        cands.append((os.path.getmtime(f), f))
+    except OSError:
+        pass
+cands.sort(reverse=True)
+
+# 系统里混着大量 diskwrites_resource 之类的统计报告，第二段不是 JSON，只能按内容筛真正的崩溃报告
+best = None
+fallback = None
+now = time.time()
+for mtime, f in cands[:300]:
+    meta, data = load(f)
+    if data is None:
+        continue
+    if "exception" not in data and "termination" not in data:
+        continue
+    label = f"{meta.get('app_name') or ''} {os.path.basename(f)}".lower()
+    if app_name and app_name.lower() in label:
+        best = (meta, data, f)
+        break
+    # 兜底只接受 5 分钟内的崩溃，避免把陈年系统崩溃当成这次的问题
+    if fallback is None and now - mtime < 300:
+        fallback = (meta, data, f)
+
+chosen = best or fallback
+if not chosen:
+    print("CRASHFILE\t")
+    sys.exit(0)
+
+meta, data, path = chosen
+kept = path
+try:
+    kept = os.path.join(saved, os.path.basename(path))
+    shutil.copy(path, kept)
+except Exception:
+    kept = path
+
+exc = data.get("exception") or {}
+term = data.get("termination") or {}
+images = data.get("usedImages") or []
+
+def symbolize(image_index, offset):
+    if not symbol_sources or not isinstance(image_index, int) or image_index >= len(images):
+        return ""
+    img = images[image_index]
+    if not isinstance(img, dict):
+        return ""
+    base = img.get("base")
+    arch = img.get("arch") or "arm64"
+    if not isinstance(base, int):
+        return ""
+    for src in symbol_sources:
+        try:
+            out = subprocess.run(
+                ["atos", "-arch", arch, "-o", src, "-l", hex(base), hex(base + offset)],
+                capture_output=True, text=True, timeout=15)
+            text = out.stdout.strip()
+            # 符号化失败时 atos 只回显 "0x... (in Foo)"，没有任何函数名
+            if text and not re.match(r"^0x[0-9a-fA-F]+ \(in ", text):
+                return text
+        except Exception:
+            continue
+    return ""
+
+# NSException 类闪退要读 lastExceptionBacktrace：faultingThread 那几条通常只是
+# abort / pthread_kill，看不出业务代码在哪
+frames = []
+leb = data.get("lastExceptionBacktrace")
+if isinstance(leb, list) and leb:
+    frames = leb
+else:
+    threads = data.get("threads") or []
+    ft = data.get("faultingThread")
+    for i, th in enumerate(threads):
+        if th.get("triggered") or (isinstance(ft, int) and i == ft):
+            frames = th.get("frames") or []
+            break
+
+def emit(tag, value):
+    if value:
+        print(f"{tag}\t{str(value).replace(chr(9), ' ')}")
+
+# exceptionReason.composed_message 是 NSException 的完整原因，比 termination 具体得多
+er = data.get("exceptionReason")
+reason = ""
+if isinstance(er, dict):
+    reason = er.get("composed_message") or ""
+elif isinstance(er, str):
+    reason = er
+if not reason:
+    reason = " / ".join(term.get("reasons") or []) or term.get("indicator") or ""
+
+emit("EXCTYPE", exc.get("type") or "")
+emit("SIGNAL", exc.get("signal") or "")
+emit("REASON", reason)
+emit("CRASHFILE", kept)
+
+app_idx = set()
+for i, img in enumerate(images):
+    if not isinstance(img, dict):
+        continue
+    nm = (img.get("name") or "").lower()
+    pth = (img.get("path") or "").lower()
+    if app_name and app_name.lower() in (nm + " " + pth):
+        app_idx.add(i)
+
+def render(fr):
+    idx = fr.get("imageIndex")
+    off = fr.get("imageOffset") or 0
+    sym = fr.get("symbol") or ""
+    loc = fr.get("symbolLocation")
+    src = fr.get("sourceFile") or ""
+    line = fr.get("sourceLine")
+    img_name = ""
+    if isinstance(idx, int) and idx < len(images) and isinstance(images[idx], dict):
+        img_name = images[idx].get("name") or ""
+    # App 帧即使已带方法名，也要用 dSYM 补出 文件:行
+    if isinstance(idx, int) and idx in app_idx:
+        resolved = symbolize(idx, off)
+        if resolved:
+            return resolved
+    if not sym and isinstance(idx, int):
+        sym = symbolize(idx, off)
+    where = f"{os.path.basename(src)}:{line}" if (src and line) else ""
+    text = where
+    if sym:
+        text = (text + "  " if text else "") + sym + (f" + {loc}" if loc else "")
+    if not text:
+        # App 帧常常不带符号，必须有 dSYM 才能还原成 文件:行
+        text = f"{img_name or ('image[%s]' % idx)} + {off}（未符号化，缺 dSYM）"
+    return text
+
+# App 自己的帧才指向代码，优先输出；系统库帧作为上下文补几条
+own = [fr for fr in frames if isinstance(fr, dict) and fr.get("imageIndex") in app_idx]
+others = [fr for fr in frames if isinstance(fr, dict) and fr.get("imageIndex") not in app_idx]
+for shown, fr in enumerate(own[:3] + others[:3]):
+    print(f"FRAME{shown}\t{render(fr)}")
+PY
+}
+
+if [[ "$ALIVE" == "0" ]]; then
+  SUMMARY="$RUN_TMP/crash.txt"
+  crash_report > "$SUMMARY"
+  EXCTYPE="$(awk -F'\t' '$1=="EXCTYPE"{print $2}' "$SUMMARY" 2>/dev/null | head -1)"
+  REASON="$(awk -F'\t' '$1=="REASON"{print $2}' "$SUMMARY" 2>/dev/null | head -1)"
+  CRASHFILE="$(awk -F'\t' '$1=="CRASHFILE"{print $2}' "$SUMMARY" 2>/dev/null | head -1)"
+  DIAG="运行中闪退（进程已退出）"
+  [[ -n "$EXCTYPE" ]] && DIAG="运行中闪退（${EXCTYPE}）"
+  HINT="按崩溃帧里的 文件:行 定位并修复，然后重跑；若帧全在系统库，看 原因 里的异常信息"
+
+  cp "$LOG" "$LASTLOG" 2>/dev/null || true
+
+  if [[ $JSON -eq 1 ]]; then
+    python3 - "$SUMMARY" "$BUNDLE_ID" "$UDID" "$DEVNAME" "$SCHEME" "$LASTLOG" "$WAIT_SECS" <<'PY'
+import json, os, sys
+summary, bundle, udid, name, scheme, log, wait = sys.argv[1:8]
+info, frames = {}, []
+try:
+    for line in open(summary, errors="ignore"):
+        line = line.rstrip("\n")
+        if "\t" not in line:
+            continue
+        k, v = line.split("\t", 1)
+        if k.startswith("FRAME"):
+            frames.append(v)
+        else:
+            info[k] = v
+except Exception:
+    pass
+diag = "运行中闪退" + (f"（{info['EXCTYPE']}）" if info.get("EXCTYPE") else "")
+print(json.dumps({
+    "result": "failure",
+    "stage": "运行",
+    "exitCode": 1,
+    "diagnosis": diag,
+    "hint": f"进程在启动后 {wait}s 内退出。按 frames 里的 文件:行 修复代码，然后重跑",
+    "reason": info.get("REASON") or None,
+    "frames": frames,
+    "crashReport": info.get("CRASHFILE") or None,
+    "bundleId": bundle,
+    "scheme": scheme,
+    "device": {"name": name, "udid": udid},
+    "log": log,
+}, ensure_ascii=False, indent=None if os.environ.get("IOSRUN_COMPACT") == "1" else 1))
+PY
+  else
+    echo "✘ 运行失败：启动后 ${WAIT_SECS}s 内退出（闪退）"
+    echo "  诊断: ${DIAG}"
+    [[ -n "$REASON" ]] && echo "  原因: ${REASON}"
+    echo "  建议: ${HINT}"
+    if grep -q '^FRAME0' "$SUMMARY" 2>/dev/null; then
+      echo "  崩溃栈:"
+      awk -F'\t' '$1 ~ /^FRAME/ {print "    " $2}' "$SUMMARY" | head -6
+    fi
+    [[ -n "$CRASHFILE" ]] && echo "  崩溃报告: ${CRASHFILE}"
+    echo "  日志: $LASTLOG"
+  fi
+
+  [[ $VERBOSE -eq 1 ]] && tail -20 "$SUMMARY"
+  exit 1
+fi
+
+# ---------- 9. 记住本次设备，下次自动沿用 ----------
 mkdir -p "$STATE_DIR" 2>/dev/null || true
 printf '%s\t%s\n' "$UDID" "$DEVNAME" >"$LAST_DEV_FILE" 2>/dev/null || true
 
-# ---------- 9. 成功输出 ----------
+# ---------- 10. 成功输出 ----------
 if [[ $JSON -eq 1 ]]; then
-  python3 - "$BUNDLE_ID" "$APP" "$UDID" "$DEVNAME" "$SCHEME" "$T_BUILD" "$T_INSTALL" "$T_LAUNCH" <<'PY'
-import json, sys
-bundle, app, udid, name, scheme, tb, ti, tl = sys.argv[1:9]
+  python3 - "$BUNDLE_ID" "$APP" "$UDID" "$DEVNAME" "$SCHEME" "$T_BUILD" "$T_INSTALL" "$T_LAUNCH" "$ALIVE" "$WAIT_SECS" <<'PY'
+import json, os, sys
+bundle, app, udid, name, scheme, tb, ti, tl, alive, wait = sys.argv[1:11]
 print(json.dumps({
     "result": "success",
     "stage": "launched",
@@ -370,11 +652,20 @@ print(json.dumps({
     "app": app,
     "scheme": scheme,
     "device": {"name": name, "udid": udid},
+    "alive": True if alive == "1" else None,
+    "verifySeconds": int(wait),
     "seconds": {"build": int(tb), "install": int(ti), "launch": int(tl)},
-}, ensure_ascii=False, indent=1))
+}, ensure_ascii=False, indent=None if os.environ.get("IOSRUN_COMPACT") == "1" else 1))
 PY
 else
   echo "✔ 编译 ${T_BUILD}s · 安装 ${T_INSTALL}s · 启动 ${T_LAUNCH}s"
+  if [[ "$ALIVE" == "1" ]]; then
+    echo "  运行: 正常（已存活 ${WAIT_SECS}s）"
+  elif [[ "$ALIVE" == "0" ]]; then
+    echo "  运行: 未知"
+  else
+    echo "  运行: 未校验"
+  fi
   echo "  设备: $DEVNAME（来源：${DEVSRC}）"
   echo "  Bundle: $BUNDLE_ID"
   echo "  产物: $APP"

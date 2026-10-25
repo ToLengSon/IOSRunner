@@ -19,7 +19,7 @@ Xcode 本体不需要打开，但必须已安装（提供 `xcodebuild`、iOS SDK
 - CodeBuddy：`~/.codebuddy/skills/ios-run/`
 - Cursor：`~/.cursor/skills/ios-run/`
 
-一条命令走完编译 → 安装 → 启动，完整日志写文件，终端只输出结论。
+一条命令走完编译 → 安装 → 启动 → 校验存活，闪退时自动给出崩溃帧。完整日志写文件，终端只输出结论。
 
 ```bash
 S=<本skill目录>/scripts/ios-run.sh
@@ -35,6 +35,12 @@ bash $S --json
 
 # 清理后重编
 bash $S --clean
+
+# 启动后等 5s 再判断是否闪退（默认 3s，0 关闭校验）
+bash $S --wait 5
+
+# 图形界面用的事件流（NDJSON，界面逐行解析，无需读这一项）
+bash $S --events
 ```
 
 自动化场景优先用 `--json`，只解析需要的字段，避免把几百行构建日志读进上下文。
@@ -67,13 +73,21 @@ bash $S --clean
 
 1. 修改代码
 2. 执行 `ios-run.sh --json`（项目路径用 `-p` 指定）
-3. 读取输出：
-   - `result: success` → 告知用户已在手机上启动，请其在设备上验证效果
-   - `result: failure` → 读 `diagnosis` 和 `errors`
-4. 失败时按 `hint` 处理：
+3. 读取输出，先看 `result`：
+   - `result: success` + `alive: true` → 进程已存活，告知用户在手机上验证效果
+   - `result: success` + `alive: null` → 启动成功但查询进程失败（设备掉线等），按成功处理
+   - `result: failure` + `stage: 运行` → **闪退**，见第 4 步
+   - `result: failure` + 其他 stage → 编译/安装失败，见第 5 步
+4. **闪退（`stage: 运行`）闭环**：
+   - `frames` 里带 `文件:行` 的那一帧就是崩溃点，直接改那段代码，然后重跑，不要反问用户
+   - 帧全落在系统库时，用 `reason` 判断类型：`unrecognized selector`（调了不存在的方法）、`index beyond bounds`（越界）、`unexpectedly found nil`（强制解包）、`EXC_BAD_ACCESS`（野指针/并发释放）
+   - **交互触发的闪退**（用户说「点某个按钮后崩」）3 秒校验抓不到，要用 `--wait 30` 重跑，并提示用户现在去点按钮
+   - 需要更多上下文时读 `crashReport` 指向的 `.ips`（已持久化到 `~/Library/Caches/ios-run/crash/`），**不要建议用户开 Xcode**
+   - 同一处连续两次改动后仍崩，把 `reason` 和 `frames` 原文交给用户，停止盲改
+5. **编译/安装失败**按 `hint` 处理：
    - 若是**代码问题**（`errors` 里是 `文件:行:列: error: ...`）→ 直接改代码，然后重跑，不要反问用户
    - 若是**环境问题**（`diagnosis` 非空，如证书、SDK、设备）→ 告知用户需要做的那一步，这属于用户侧操作
-5. 连续两次因环境问题失败时，停止重试，明确告诉用户缺什么
+6. 连续两次因环境问题失败时，停止重试，明确告诉用户缺什么
 
 ## 输出格式
 
@@ -94,6 +108,21 @@ bash $S --clean
   建议: 打开 Xcode → Settings → Accounts 登录 Apple ID（免费账号即可）
   错误:
     error: No signing certificate "iOS Development" found: ...
+  日志: ${TMPDIR}/ios-run-last.log
+```
+
+闪退（`stage: 运行`，脚本自己从设备拉崩溃日志）：
+
+```
+✘ 运行失败：启动后 12s 内退出（闪退）
+  诊断: 运行中闪退（EXC_CRASH）
+  原因: *** -[__NSArray0 objectAtIndex:]: index 3 beyond bounds for empty array
+  建议: 按崩溃帧里的 文件:行 定位并修复，然后重跑；若帧全在系统库，看 原因 里的异常信息
+  崩溃栈:
+    -[ViewController crashNow] (in Test) (ViewController.m:219)
+    main (in Test) (main.m:17)
+    __exceptionPreprocess + 164
+  崩溃报告: ~/Library/Caches/ios-run/crash/Test-2026-10-25-121854.ips
   日志: ${TMPDIR}/ios-run-last.log
 ```
 
@@ -123,6 +152,9 @@ JSON：
 6. **免费账号 profile 7 天过期**：手机上的 App 到期会闪退，重新运行一次即自动续期，数据不丢。
 7. **首次运行需要在手机上信任证书**：设置 → 通用 → VPN 与设备管理 → 开发者 App → 信任。iOS 16+ 还需先开启「开发者模式」并重启。
 8. **不要用 `open -a Xcode`**，也不要建议用户打开 Xcode 来做日常运行，只在必须登录 Apple ID 或下载 SDK 组件时才指引打开。
+9. **launch 返回 0 ≠ 启动成功**：`devicectl process launch` 只保证启动请求被接受，App 秒退同样返回 0。脚本默认启动后等 3s 回查进程存活（`--wait` 调整，`0` 关闭），闪退时自动从设备 `systemCrashLogs` 域拉 `.ips` 并解析出崩溃帧，**全程不需要打开 Xcode**。
+10. **构建默认带 dSYM**：脚本给 `xcodebuild` 传 `DEBUG_INFORMATION_FORMAT=dwarf-with-dsym`。Debug 默认是 `dwarf`，二进制会被 strip，闪退栈只剩 `Foo + 5888872` 这种地址，无法定位。有 dSYM 后 App 帧会自动用 `atos` 还原成 `文件:行`。若仍显示「未符号化」，说明 dSYM 与设备上的包不匹配（代码改过但没重新构建安装）。
+11. **App 帧优先**：崩溃栈前几条常是系统库（CoreFoundation、libsystem_*），那是表象；脚本会把 App 自己的帧排在前面，根因优先看它。帧全在系统库时，靠 `reason` 判断（如 `unrecognized selector`、野指针）。
 
 ## 环境前提
 
